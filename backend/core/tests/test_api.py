@@ -154,7 +154,7 @@ def test_task_download_end_to_end(client, connected, fake_redis, monkeypatch, tm
         YandexClient, "get_resource", lambda self, path: {"file": "http://fake", "size": 10}
     )
 
-    def fake_stream(self, url, dest, cancel_check=None, chunk_size=1):
+    def fake_stream(self, url, dest, cancel_check=None, chunk_size=1, expected_size=None):
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"0123456789")

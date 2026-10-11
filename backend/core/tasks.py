@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+import httpx
 import redis
 from celery import shared_task
 from django.db import transaction
@@ -163,7 +164,7 @@ def run_download(self, task_id):
     client.close()
 
 
-@shared_task(bind=True, acks_late=True, max_retries=5, default_retry_delay=5, name="core.tasks.download_file")
+@shared_task(bind=True, acks_late=True, max_retries=3, default_retry_delay=5, name="core.tasks.download_file")
 def download_file(self, task_id, disk_path, size, dest):
     """Скачивает один файл, сохраняя структуру: dest + путь файла от корня диска."""
     if is_cancelled(task_id):
@@ -181,7 +182,7 @@ def download_file(self, task_id, disk_path, size, dest):
             if not url:
                 raise YandexAPIError(500, "Не получен URL для скачивания", retryable=True)
             target = safe_join(Path(dest), yandex_rel(disk_path))
-            client.stream_to_file(url, target, cancel_check=lambda: is_cancelled(task_id))
+            client.stream_to_file(url, target, cancel_check=lambda: is_cancelled(task_id), expected_size=size)
         except CancelledDownload:
             return "cancelled"
         except YandexAPIError as e:
@@ -190,8 +191,19 @@ def download_file(self, task_id, disk_path, size, dest):
             record_error(task_id, disk_path, f"HTTP {e.status}: {e.message}")
             _mark_done(task_id, size, ok=False)
             return "failed"
-        except (OSError, PathError) as e:
-            record_error(task_id, disk_path, str(e))
+        except httpx.TransportError as e:
+            # Сетевые сбои (таймауты, разрывы, DNS) — ретраим
+            if self.request.retries < self.max_retries:
+                logger.warning("Network error for %s (%s), retry %d/%d",
+                               disk_path, type(e).__name__, self.request.retries + 1, self.max_retries)
+                raise self.retry(exc=e, countdown=min(120, 2 ** (self.request.retries + 1)))
+            record_error(task_id, disk_path, f"Сетевая ошибка: {type(e).__name__}")
+            _mark_done(task_id, size, ok=False)
+            return "failed"
+        except Exception as e:
+            # Непредвиденная ошибка — обязательно фиксируем, чтобы прогресс задачи не «завис»
+            logger.exception("Unexpected error downloading %s", disk_path)
+            record_error(task_id, disk_path, f"Ошибка: {type(e).__name__}: {e}"[:300])
             _mark_done(task_id, size, ok=False)
             return "failed"
         _mark_done(task_id, size, ok=True)

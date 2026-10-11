@@ -1,6 +1,7 @@
 """Мини-клиент классического API Яндекс Диска (https://yandex.ru/dev/disk-api)."""
 
 import os
+import socket
 import time
 from pathlib import Path
 
@@ -8,6 +9,30 @@ import httpx
 
 BASE_URL = "https://cloud-api.yandex.net/v1"
 CHUNK_SIZE = 1024 * 1024
+
+_orig_getaddrinfo = socket.getaddrinfo
+_ipv4_resolver_installed = False
+
+
+def install_ipv4_resolver():
+    """Принудительно резолвим хосты только в IPv4 (идемпотентно).
+
+    На хостах без IPv6-маршрута httpx падает с «Network is unreachable» (Errno 101)
+    или «Address family not supported» (Errno -9), когда DNS отдаёт AAAA-запись.
+    Фильтруем результат getaddrinfo до AF_INET; если IPv4-записи нет — возвращаем как есть.
+    """
+    global _ipv4_resolver_installed
+    if _ipv4_resolver_installed:
+        return
+
+    def getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        try:
+            return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        except socket.gaierror:
+            return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = getaddrinfo_ipv4_only
+    _ipv4_resolver_installed = True
 
 
 class YandexAPIError(Exception):
@@ -28,17 +53,19 @@ class CancelledDownload(Exception):
 
 
 class YandexClient:
-    def __init__(self, token, rate_limiter=None, timeout=60.0, force_ipv4=None):
+    def __init__(self, token, rate_limiter=None, timeout=None, force_ipv4=None):
         self.token = token
         self.rate_limiter = rate_limiter
         if force_ipv4 is None:
             force_ipv4 = os.environ.get("FORCE_IPV4", "1") == "1"
-        # На хостах без IPv6-маршрута резолвер может отдать A-запись IPv6 и
-        # соединение падает с «Network is unreachable» — принудительно используем IPv4.
-        kwargs = {"timeout": timeout, "follow_redirects": True}
         if force_ipv4:
-            kwargs["transport"] = httpx.HTTPTransport(local_address="0.0.0.0")
-        self._http = httpx.Client(**kwargs)
+            install_ipv4_resolver()
+        # connect=30s (TCP+TLS), read=30s (пауза между байтами).
+        # Здоровый поток отдаёт данные непрерывно (наблюдали 300+ КБ/с),
+        # пауза 30с — мёртвое соединение (сломанная копия файла на CDN Яндекса).
+        if timeout is None:
+            timeout = httpx.Timeout(30.0, connect=30.0, write=30.0, pool=30.0)
+        self._http = httpx.Client(timeout=timeout, follow_redirects=True)
 
     def close(self):
         self._http.close()
@@ -217,8 +244,12 @@ class YandexClient:
             return f.get("download_url") or f.get("url")
         return resource.get("download_url")
 
-    def stream_to_file(self, url, dest, cancel_check=None, chunk_size=CHUNK_SIZE):
-        """Стримит файл с download_url в ``dest`` (через .part-файл). Возвращает число байт."""
+    def stream_to_file(self, url, dest, cancel_check=None, chunk_size=CHUNK_SIZE, expected_size=None):
+        """Стримит файл с download_url в ``dest`` (через .part-файл). Возвращает число байт.
+
+        Если ``expected_size`` задан, проверяем целостность: меньше байт — файл
+        удаляется и бросается ошибка (защита от усечённых копий в CDN Яндекса).
+        """
         dest = Path(dest)
         tmp = dest.with_name(dest.name + ".part")
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -241,5 +272,16 @@ class YandexClient:
                         raise CancelledDownload()
                     f.write(chunk)
                     written += len(chunk)
+        if expected_size is not None and written != int(expected_size):
+            tmp.unlink(missing_ok=True)
+            # 0 байт — нода не может отправить начало файла: ретраи бессмысленны,
+            # файл помечаем ошибкой сразу, чтобы не забивать воркеров.
+            # Частичная посылка (written > 0) — возможно транзитный сбой, ретраим.
+            retryable = written > 0
+            raise YandexAPIError(
+                502,
+                f"CDN отправил {written:,} из {int(expected_size):,} байт (повреждённая копия файла на стороне Яндекса)",
+                retryable=retryable,
+            )
         os.replace(tmp, dest)
         return written

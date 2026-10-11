@@ -133,7 +133,7 @@ def _task_payload(t):
 
     errors = []
     try:
-        for raw in r.lrange(k(tid, "errors"), -20, -1):
+        for raw in r.lrange(k(tid, "errors"), -50, -1):
             errors.append(json.loads(raw))
     except Exception:
         pass
@@ -215,11 +215,14 @@ class TaskDetailView(APIView):
             return Response({"error": "Не найдено"}, status=status.HTTP_404_NOT_FOUND)
         r = get_redis()
         tid = str(pk)
-        for name in ("total_files", "total_bytes", "done_files", "done_bytes", "failed_files", "errors", "cancel"):
-            try:
+        # Флаг отмены НЕ удаляем, а устанавливаем: задачи download_file, уже стоящие
+        # в очереди, должны быстро отброситься, не тратя сеть и воркеры.
+        try:
+            set_cancelled(tid)
+            for name in ("total_files", "total_bytes", "done_files", "done_bytes", "failed_files", "errors"):
                 r.delete(k(tid, name))
-            except Exception:
-                pass
+        except Exception:
+            pass
         return Response({"deleted": True})
 
 

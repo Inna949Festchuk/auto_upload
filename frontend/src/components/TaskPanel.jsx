@@ -95,15 +95,30 @@ function TaskCard({ task, onRefresh }) {
           </button>
         )}
         {!active && (
-          <button
-            className="btn btn-small btn-ghost"
-            onClick={async () => {
-              await api.deleteTask(task.id).catch(() => {});
-              onRefresh();
-            }}
-          >
-            Убрать
-          </button>
+          <>
+            {task.failed_files > 0 && task.errors.length > 0 && (
+              <button
+                className="btn btn-small btn-primary"
+                title="Создаст новую задачу с файлами, которые не скачались (копии на CDN Яндекса могут восстановиться)"
+                onClick={async () => {
+                  const items = task.errors.map((e) => ({ path: e.path, type: "file" }));
+                  await api.createTask(task.dest, items).catch(() => {});
+                  onRefresh();
+                }}
+              >
+                Повторить неудавшиеся ({task.errors.length})
+              </button>
+            )}
+            <button
+              className="btn btn-small btn-ghost"
+              onClick={async () => {
+                await api.deleteTask(task.id).catch(() => {});
+                onRefresh();
+              }}
+            >
+              Убрать
+            </button>
+          </>
         )}
       </div>
     </div>
