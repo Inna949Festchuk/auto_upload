@@ -1,0 +1,52 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DOWNLOAD_ROOT=${DOWNLOAD_ROOT:-/data}
+      - API_QPS=${API_QPS:-4}
+      - FORCE_IPV4=${FORCE_IPV4:-1}
+      - YANDEX_CLIENT_ID=${YANDEX_CLIENT_ID:-}
+      - SECRET_KEY=${SECRET_KEY:-dev-insecure-secret-key}
+    volumes:
+      - ./data:/data
+      - ./var:/var
+    depends_on:
+      - redis
+
+  celery:
+    build: ./backend
+    restart: unless-stopped
+    command: celery -A config worker --loglevel=info --concurrency=${DOWNLOAD_CONCURRENCY:-8} --prefetch-multiplier=1
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DOWNLOAD_ROOT=${DOWNLOAD_ROOT:-/data}
+      - API_QPS=${API_QPS:-4}
+      - FORCE_IPV4=${FORCE_IPV4:-1}
+      - YANDEX_CLIENT_ID=${YANDEX_CLIENT_ID:-}
+      - SECRET_KEY=${SECRET_KEY:-dev-insecure-secret-key}
+    volumes:
+      - ./data:/data
+      - ./var:/var
+    depends_on:
+      - redis
+      - backend
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  redis_data:
